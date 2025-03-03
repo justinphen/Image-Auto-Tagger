@@ -1,57 +1,63 @@
 from PIL import Image, ImageDraw
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from ultralytics import YOLO
 import gradio as gr
 import numpy as np
 import torch
+import re
 
-def autotag_image(image, tags, threshold=0.2):
-    # Load CLIP model and processor
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# Load Qwen2.5VL
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+processor = AutoProcessor.from_pretrained(model_name)
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
 
-    # Process the image and text prompts
-    inputs = processor(text=tags, images=image, return_tensors="pt", padding=True)
-
-    # Get model outputs
-    with torch.no_grad():
-        outputs = model(**inputs)
-        logits_per_image = outputs.logits_per_image
-        probs = logits_per_image.softmax(dim=1)
-
-    # Filter tags based on the threshold
-    predicted_tags = [tags[i] for i, prob in enumerate(probs[0]) if prob > threshold]
-    return predicted_tags
+# Load YOLO model
+yolo_model = YOLO("yolov8m.pt")
 
 def process_image(image, text_prompt, annotation_format):
-    # Load YOLO model
-    yolo_model = YOLO("yolov8m.pt")
+    inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(device)
 
-    # Detect objects
+    with torch.no_grad():
+        output = model.generate(**inputs, max_new_tokens=200)
+    response_text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    # Extract object names from the response
+    relevant_objects = extract_relevant_objects(response_text)
+
+    # Run YOLO detection
     yolo_results = yolo_model(image)
     boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
     labels = yolo_results[0].boxes.cls.cpu().numpy()
 
-    # Draw bounding boxes on the image
+    # Draw bounding boxes for relevant objects only
     image_np = np.array(image)
     draw = ImageDraw.Draw(image)
-    for box, label in zip(boxes, labels):
-        x1, y1, x2, y2 = map(int, box)
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        draw.text((x1, y1 - 10), f"Class {int(label)}", fill="red")
-
-    # Generate annotations in the selected format
     annotations = []
     image_width, image_height = image.size
+
     for i, (box, label) in enumerate(zip(boxes, labels)):
-        if annotation_format == "YOLO":
-            annotations.append(to_yolo_format(box, image_width, image_height))
-        elif annotation_format == "COCO":
-            annotations.append(to_coco_format(box, image_id=1, annotation_id=i + 1))
-        elif annotation_format == "CVAT":
-            annotations.append(to_cvat_format(box, f"Class {int(label)}"))
+        label_text = f"Class {int(label)}"
+        if any(obj.lower() in label_text.lower() for obj in relevant_objects):
+            x1, y1, x2, y2 = map(int, box)
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+            draw.text((x1, y1 - 10), label_text, fill="red")
+
+            # Generate annotations
+            if annotation_format == "YOLO":
+                annotations.append(to_yolo_format(box, image_width, image_height))
+            elif annotation_format == "COCO":
+                annotations.append(to_coco_format(box, image_id=1, annotation_id=i + 1))
+            elif annotation_format == "CVAT":
+                annotations.append(to_cvat_format(box, label_text))
 
     return image, "\n".join(annotations) if annotation_format != "COCO" else annotations
+
+def extract_relevant_objects(response_text):
+    # Extract possible object names from Qwen2.5VL's response
+    object_list = re.findall(r'\b[a-zA-Z]+(?:\s[a-zA-Z]+)?\b', response_text)
+    return [obj.lower() for obj in object_list if len(obj) > 2]
 
 def to_yolo_format(box, image_width, image_height):
     x1, y1, x2, y2 = box
@@ -82,7 +88,6 @@ def run_app(image, text_prompt, annotation_format):
     annotated_image, annotations = process_image(image, text_prompt, annotation_format)
     return annotated_image, annotations
 
-
 interface = gr.Interface(
     fn=run_app,
     inputs=[
@@ -94,7 +99,7 @@ interface = gr.Interface(
         gr.Image(label="Annotated Image"),
         gr.Textbox(label="Annotations"),
     ],
-    title="Image Autotagger"
+    title="Qwen2.5VL Image Annotation"
 )
 
 interface.launch(share=True)
