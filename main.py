@@ -1,45 +1,79 @@
-from PIL import Image, ImageDraw
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor, Qwen2_5_VLForConditionalGeneration
-from ultralytics import YOLO
-import gradio as gr
-import numpy as np
 import torch
+import gradio as gr
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from ultralytics import YOLO
+from PIL import Image, ImageDraw
+import numpy as np
 import re
 
-# Load Qwen2.5VL
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-processor = AutoProcessor.from_pretrained(model_name)
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+# Load Qwen2.5-VL model
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    "Qwen/Qwen2.5-VL-7B-Instruct",
+    torch_dtype=torch.float16,
+    attn_implementation="flash_attention_2",
+    device_map="auto"
+)
+
+# Load the processor
+processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
 
 # Load YOLO model
 yolo_model = YOLO("yolov8m.pt")
 
-def process_image(image, text_prompt, annotation_format):
-    inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(device)
+# Define the function for Gradio
+def generate_response(image, text_prompt, annotation_format):
+    if image is None or text_prompt.strip() == "":
+        return "Please provide both an image and a text prompt."
 
+    # Use VLM to identify relevant objects
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": text_prompt},
+            ],
+        }
+    ]
+
+    # Prepare input for Qwen2.5-VL
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(
+        text=[text],
+        images=[image],
+        padding=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    # Generate response VLM
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=200)
-    response_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        generated_ids = model.generate(**inputs, max_new_tokens=1280)
 
-    # Extract object names from the response
-    relevant_objects = extract_relevant_objects(response_text)
+    # Decode response
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )[0]
 
-    # Run YOLO detection
+    # Extract relevant objects from VLM response
+    relevant_objects = extract_relevant_objects(output_text)
+
+    # Run YOLO detection and filter for relevant objects
     yolo_results = yolo_model(image)
     boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
     labels = yolo_results[0].boxes.cls.cpu().numpy()
+    class_names = yolo_model.names
 
-    # Draw bounding boxes for relevant objects only
-    image_np = np.array(image)
+    # Draw bounding boxes and generate annotations
     draw = ImageDraw.Draw(image)
     annotations = []
     image_width, image_height = image.size
 
-    for i, (box, label) in enumerate(zip(boxes, labels)):
-        label_text = f"Class {int(label)}"
-        if any(obj.lower() in label_text.lower() for obj in relevant_objects):
+    for box, label in zip(boxes, labels):
+        label_text = class_names[int(label)]
+        if label_text.lower() in relevant_objects:
             x1, y1, x2, y2 = map(int, box)
             draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
             draw.text((x1, y1 - 10), label_text, fill="red")
@@ -48,16 +82,26 @@ def process_image(image, text_prompt, annotation_format):
             if annotation_format == "YOLO":
                 annotations.append(to_yolo_format(box, image_width, image_height))
             elif annotation_format == "COCO":
-                annotations.append(to_coco_format(box, image_id=1, annotation_id=i + 1))
+                annotations.append(to_coco_format(box, image_id=1, annotation_id=len(annotations) + 1))
             elif annotation_format == "CVAT":
                 annotations.append(to_cvat_format(box, label_text))
 
-    return image, "\n".join(annotations) if annotation_format != "COCO" else annotations
+    # Format annotations based on user selection
+    if annotation_format == "YOLO":
+        annotations_output = "\n".join(annotations)
+    elif annotation_format == "COCO":
+        annotations_output = annotations
+    elif annotation_format == "CVAT":
+        annotations_output = "\n".join(annotations)
+
+    return image, annotations_output
 
 def extract_relevant_objects(response_text):
-    # Extract possible object names from Qwen2.5VL's response
-    object_list = re.findall(r'\b[a-zA-Z]+(?:\s[a-zA-Z]+)?\b', response_text)
-    return [obj.lower() for obj in object_list if len(obj) > 2]
+    # Extract relevant objects from Qwen2.5-VL's response
+    print(response_text)
+    objects = re.findall(r'\b[a-zA-Z]+\b', response_text.lower())
+    print(objects)
+    return set(objects)
 
 def to_yolo_format(box, image_width, image_height):
     x1, y1, x2, y2 = box
@@ -84,14 +128,11 @@ def to_cvat_format(box, label):
     x1, y1, x2, y2 = box
     return f"{label} {x1} {y1} {x2} {y2}"
 
-def run_app(image, text_prompt, annotation_format):
-    annotated_image, annotations = process_image(image, text_prompt, annotation_format)
-    return annotated_image, annotations
-
-interface = gr.Interface(
-    fn=run_app,
+# Gradio Interface
+demo = gr.Interface(
+    fn=generate_response,
     inputs=[
-        gr.Image(type="pil", label="Upload Image"),
+        gr.Image(type="pil"),
         gr.Textbox(label="Text Prompt"),
         gr.Radio(["YOLO", "COCO", "CVAT"], label="Annotation Format"),
     ],
@@ -99,7 +140,9 @@ interface = gr.Interface(
         gr.Image(label="Annotated Image"),
         gr.Textbox(label="Annotations"),
     ],
-    title="Qwen2.5VL Image Annotation"
+    title="Qwen2.5-VL + YOLO Image Annotation",
+    description="Upload an image, enter a text prompt, and select an annotation format to get an annotated image and annotations.",
 )
 
-interface.launch(share=True)
+# Run the Gradio app
+demo.launch(share=True)
