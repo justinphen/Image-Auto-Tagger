@@ -5,7 +5,7 @@ class ObjectDetection:
         self.model = self._load_yolo_model()
 
     def _load_yolo_model(self):
-        return YOLO("yolov8m.pt")
+        return YOLO("models/yolov8m.pt")
 
     def detect_objects(self, image):
         results = self.model(image)
