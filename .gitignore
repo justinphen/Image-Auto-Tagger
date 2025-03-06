@@ -1,3 +1,4 @@
 .gradio/
-.playground/
+playground/
+__pycache__
 *.pt
