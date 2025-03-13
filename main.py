@@ -6,7 +6,15 @@ from utils.vlm import VisionLanguageModel
 
 class ImageAutotagger:
     def __init__(self):
-        # Initialize models and utilities
+        """
+        Initializes the ImageAutotagger class.
+
+        This class integrates the following components:
+        - AnnotationFormats: For converting bounding boxes to various formats (YOLO, COCO, CVAT).
+        - ObjectDetection: For detecting objects in images using YOLOv8.
+        - RegionSegmentation: For segmenting objects in images using SAM2.
+        - VisionLanguageModel: For identifying objects in segmented images using Qwen2.5-VL.
+        """
         self.annotation = AnnotationFormats()
         self.object_detection = ObjectDetection()
         self.region_segmentation = RegionSegmentation()
@@ -17,6 +25,9 @@ class ImageAutotagger:
         self.demo = self.gradio_interface.create_interface()
 
     def __call__(self):
+        """
+        Launches the Gradio interface for the Image Autotagger.
+        """
         self.demo.launch(share=True)
 
 if __name__ == "__main__":

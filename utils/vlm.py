@@ -1,63 +1,92 @@
 import torch
 import re
+import numpy as np
 
 from PIL import Image
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 class VisionLanguageModel:
     def __init__(self):
+        """
+        Initializes the VisionLanguageModel class by loading the Qwen2.5-VL model and processor.
+        
+        - Model: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - Data type: torch.float16 (for efficiency)
+        - Attention implementation: flash_attention_2 (for faster inference)
+        - Device: Automatically mapped to available hardware (e.g., GPU or CPU).
+        """
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                         "Qwen/Qwen2.5-VL-7B-Instruct",
                         torch_dtype=torch.float16,
                         attn_implementation="flash_attention_2",
                         device_map="auto"
                     )
-        self.processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+        self.processor = AutoProcessor.from_pretrained(
+            "Qwen/Qwen2.5-VL-7B-Instruct",
+            min_pixels=256*28*28,
+            max_pixels=1280*28*28
+            )
 
-    def identify_object(self, image, text_prompt="What is this object?"):
-        # Ensure the image is a PIL image
-        if not isinstance(image, Image.Image):
+    def identify_object(self, image):
+        """
+        Identifies the primary object in the given image using the Qwen2.5-VL model.
+
+        Args:
+            image (PIL.Image or np.ndarray): Input image in PIL or NumPy array format.
+
+        Returns:
+            str: The name of the identified object.
+
+        Raises:
+            ValueError: If the input image is None or not in a valid format.
+        """
+        # Ensure image is valid
+        if image is None:
+            raise ValueError("Received None as input image.")
+
+        if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
 
-        # Calculate the maximum resolution based on the aspect ratio
-        aspect_ratio = image.width / image.height
-        max_pixels = 1_003_520  # Upper limit for the recommended token range
+        if not isinstance(image, Image.Image):
+            raise ValueError("Image must be a PIL image or NumPy array.")
 
-        # Calculate target width and height
-        target_width = int((max_pixels * aspect_ratio) ** 0.5)
-        target_height = int((max_pixels / aspect_ratio) ** 0.5)
+        # Define the expected input message format
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", 
+                     "text": "Identify the object in this image and only return the object name."
+                    },
+                ],
+            }
+        ]
 
-        # Resize the image to the target resolution
-        target_resolution = (target_width, target_height)
-        image = image.resize(target_resolution, Image.Resampling.LANCZOS)  # Use high-quality resampling
+        # Apply chat template and process vision input
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
 
-        # Debug: Check the image size and type
-        print(f"Image type: {type(image)}")
-        print(f"Image size: {image.size}")
-
-        # Prepare input for the VLM
+        # Process inputs for the model
         inputs = self.processor(
-            text=[text_prompt],
-            images=[image],
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
             padding=True,
             return_tensors="pt",
         ).to(self.model.device)
 
-        # Debug: Check the inputs
-        print(f"Inputs keys: {inputs.keys()}")
-        print(f"Pixel values shape: {inputs['pixel_values'].shape}")
-        print(f"Input IDs shape: {inputs['input_ids'].shape}")
-
-        # Generate response
+        # Generate output from the model
         with torch.no_grad():
-            generated_ids = self.model.generate(**inputs, max_new_tokens=50)
+            output_tokens = self.model.generate(**inputs, max_length=4097)
+            output_tokens_trimmed = [
+                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_tokens)
+            ]
+            output_text = self.processor.batch_decode(
+                output_tokens_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
 
-        # Decode response
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        object_name = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0]
-
-        return object_name
+        return output_text[0]

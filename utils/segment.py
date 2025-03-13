@@ -6,46 +6,74 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 class RegionSegmentation:
     def __init__(self):
-        self.model = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
+        """
+        Initializes the RegionSegmentation class by loading Meta's SAM2 model.
+        """
+        self.predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
 
-    def segment(self, image, boxes):
-        # Convert PIL Image to numpy array
-        if isinstance(image, Image.Image):
-            image = np.array(image)
+    def get_segmented_images(self, image, masks):
+        """
+        Extracts and saves segmented objects from the given masks.
 
-        # Get image dimensions
-        height, width = image.shape[:2]
+        Args:
+            image (PIL.Image): Original image.
+            masks (list of np.ndarray): List of binary masks.
 
-        # Set the image for the predictor
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            self.model.set_image(image)
-            
-            # SAM2 expects boxes in the format [x1, y1, x2, y2] with normalized coordinates
-            normalized_boxes = boxes / np.array([width, height, width, height])
-
-            # Generate masks using the bounding box prompts
-            masks, _, _ = self.model.predict(box=normalized_boxes)
-
-        # Create segmented images from the masks
+        Returns:
+            list: A list of cropped segmented images.
+        """
         segmented_images = []
-        for mask in masks:
-            # Ensure mask is a numpy array
-            if isinstance(mask, torch.Tensor):
-                mask = mask.cpu().numpy()
+        image_np = np.array(image)
 
-            # Handle multi-channel masks
-            if mask.ndim == 3:  # If the mask has multiple channels (e.g., RGB)
-                mask = mask[0]  # Use the first channel (or another channel if needed)
+        for i, mask in enumerate(masks):
+            # Ensure mask is in 2D
+            mask = mask.squeeze()
 
-            # Ensure mask is 2D
-            if mask.ndim != 2:
-                raise ValueError(f"Mask has invalid shape: {mask.shape}. Expected 2D array.")
+            # Convert mask to binary
+            mask = (mask > 0.5).astype(np.uint8) * 255
 
-            # Convert to 0-255 range
-            mask = (mask * 255).astype(np.uint8)
+            # Find bounding box of the mask
+            y_indices, x_indices = np.where(mask > 0)
+            if len(y_indices) == 0 or len(x_indices) == 0:
+                # Skip empty masks
+                continue
 
-            # Convert the mask to a PIL.Image object
-            mask_image = Image.fromarray(mask, mode="L")  # 'L' mode for grayscale
-            segmented_images.append(mask_image)
+            y_min, y_max = y_indices.min(), y_indices.max()
+            x_min, x_max = x_indices.min(), x_indices.max()
 
-        return masks, segmented_images
+            # Extract the masked object
+            masked_object = image_np * (mask[..., None] // 255)
+
+            # Crop the masked object
+            cropped_object = masked_object[y_min:y_max, x_min:x_max]
+
+            # Append the segmented image
+            segmented_images.append(cropped_object)
+
+        return segmented_images
+    
+    def run_sam2(self, bounding_boxes, image):
+        """
+        Runs SAM2 segmentation on an image using bounding boxes from YOLO.
+
+        Args:
+            image (PIL.Image): Input image.
+
+        Returns:
+            list: List of segmented images.
+        """
+        # Run SAM2 segmentation
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self.predictor.set_image(np.array(image))
+            masks, _, _ = self.predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                # Convert list to array
+                box=np.array(bounding_boxes)[None, :],
+                multimask_output=False
+            )
+
+        # Get segmented images
+        segmented_images = self.get_segmented_images(image, masks)
+        
+        return segmented_images
