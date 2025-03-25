@@ -59,6 +59,7 @@ class VisionLanguageModel:
                     {"type": "image", "image": image},
                     {"type": "text", 
                      "text": "Identify the object in this image and only return the object name."
+                             "If you are unable to identify it, your respond should be 'unknown'."
                     },
                 ],
             }
